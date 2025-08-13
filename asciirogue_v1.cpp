@@ -1,21 +1,4 @@
-// ASCII Roguelike - C++17 single-file (enriched edition)
-// Build:
-//   g++ -std=c++17 -O2 -Wall -Wextra -pedantic -o asciirogue asciirogue.cpp
-//   cl /std:c++17 /O2 /EHsc asciirogue.cpp
-// Run: ./asciirogue
-//
-// Content overview (meaningful LOC, no filler data):
-//  - Procedural dungeon with doors, traps, chests, stairs; biome affects generation
-//  - Items: weapons, armor, potions, keys, spellbooks; inventory modal
-//  - Magic: learn from spellbooks; cast with 'z' (Firebolt, Heal, Blink, IceShard, Shield)
-//  - Resources: HP/MP; Statuses: Burning, Snared, Poisoned, Regenerating, Shielded
-//  - Combat with A* pursuing monsters; FOV & fog-of-war
-//  - Search 's' to reveal nearby traps; Open 'o' for doors/chests
-//  - XP/Level-up system, character sheet ('c'), options ('O'), codex of kills ('j'), map overlay ('m')
-//  - Save/Load in robust text format (space-separated).
-//  - Optional tips.txt (no dependency) read on level entry.
-//
-// ------------------------------------------------------------------
+
 #include <algorithm>
 #include <array>
 #include <chrono>
