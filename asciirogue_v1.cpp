@@ -31,6 +31,9 @@
   #include <unistd.h>
 #endif
 
+
+constexpr int LEG_W = 20; // legend sidebar width, used both in render and generation
+
 namespace io {
 #ifdef _WIN32
 bool enableVT() {
@@ -56,31 +59,9 @@ void hideCursor(){ std::cout << "\x1b[?25l"; }
 void showCursor(){ std::cout << "\x1b[?25h"; }
 void flush(){ std::cout.flush(); }
 } // namespace io
-struct Pos;
-// Forward declarations
-struct Pos;
-struct Game;
-static void ai_turn(Game& g);
-static void process_statuses(Game& g);
-static bool target_tile(Game& g,int range, Pos& out);
-static void explode_at(Game& g, int r, int c, int radius);
-static void level_up(Game& g);
-static void world_tick(Game& g);
-
-
-// Forward decls
-struct Game;
-static void explode_at(Game& g, int r, int c, int radius);
-
 
 // ---------------- RNG ----------------
-struct RNG{ std::mt19937_64 eng; RNG():eng(std::random_device{}()){} explicit RNG(uint64_t s):eng(s){} int i(int lo,int hi){ std::uniform_int_distribution<int>d(lo,hi);
- return d(eng);
-} double d(double lo,double hi){ std::uniform_real_distribution<double>d(lo,hi);
- return d(eng);
-} bool chance(double p){ std::bernoulli_distribution b(p);
- return b(eng);
-} };
+struct RNG{ std::mt19937_64 eng; RNG():eng(std::random_device{}()){} explicit RNG(uint64_t s):eng(s){} int i(int lo,int hi){ std::uniform_int_distribution<int>d(lo,hi); return d(eng);} double d(double lo,double hi){ std::uniform_real_distribution<double>d(lo,hi); return d(eng);} bool chance(double p){ std::bernoulli_distribution b(p); return b(eng);} };
 
 // ---------------- Basics ----------------
 struct Pos{ int r=0,c=0; };
@@ -145,22 +126,15 @@ struct Entity{
 
 // ---------------- Game ----------------
 struct Options{ bool auto_open_on_bump=true; bool auto_pickup_keys=true; };
-struct Log{ std::vector<std::string> lines; void add(const std::string&s){ lines.push_back(s);
- if(lines.size()>400) lines.erase(lines.begin(),lines.begin()+200);
-} void render(int H,int W){ int start=(int)std::max(0,(int)lines.size()-3);
- for(int i=0;i<3;i++){ int idx=start+i; io::move(H-3+i,0);
- std::string row=(idx<(int)lines.size()? lines[idx]:"");
- if((int)row.size()>W) row.resize(W);
- std::cout<< std::left << std::setw(W) << row; } } };
+struct Log{ std::vector<std::string> lines; void add(const std::string&s){ lines.push_back(s); if(lines.size()>400) lines.erase(lines.begin(),lines.begin()+200);} void render(int H,int W){ int start=(int)std::max(0,(int)lines.size()-3); for(int i=0;i<3;i++){ int idx=start+i; io::move(H-3+i,0); std::string row=(idx<(int)lines.size()? lines[idx]:""); if((int)row.size()>W) row.resize(W); std::cout<< std::left << std::setw(W) << row; } } };
 
 struct Game{
     Map map; RNG rng; int level=1,max_level=8; std::string biome="Default";
     Entity player; Inventory inv; std::vector<Entity> ents; Log log; bool running=true; int gold=0;
     Pos teleporter{ -1, -1 };
-    
     std::vector<Pos> firezones;
     std::vector<int> firettl;
-// camera
+    // camera
     int cam_r=0, cam_c=0; bool cam_follow=true;
     // meta
     int xp=0, plv=1; std::unordered_map<std::string,int> kills;
@@ -178,7 +152,7 @@ static char tile_glyph(const Cell& cell){
         case Tile::StairsDown: return '>';
         case Tile::DoorClosed: return '+';
         case Tile::DoorOpen: return '/';
-        case Tile::TrapHidden: return '^';
+        case Tile::TrapHidden: return '.';
         case Tile::TrapRevealed: return '^';
         case Tile::SecretWall: return 'x'; // cracked wall
         case Tile::Teleporter: return 'T';
@@ -212,19 +186,26 @@ static void compute_fov(Map&m,int cx,int cy,int radius){
             if(dist>radius) continue;
             std::vector<Pos> line;
             bres_line(cx,cy,r,c,line);
-            bool blocked=false;
             for(size_t i=1;i<line.size();++i){
                 Pos p=line[i];
                 if(!m.in(p.r,p.c)) break;
                 set_visible(m,p.r,p.c);
-                if(los_block(m,p.r,p.c)){
-                    blocked=true;
-                    break;
-                }
+                if(los_block(m,p.r,p.c)) break;
             }
         }
     }
 }
+// LOS using Bresenham (excluding start, including end)
+static bool los_clear(const Map& m, Pos a, Pos b){
+    std::vector<Pos> line;
+    bres_line(a.r,a.c,b.r,b.c,line);
+    for(size_t i=1;i<line.size();++i){
+        Pos p=line[i];
+        if(opaque(m,p.r,p.c)) return (p.r==b.r && p.c==b.c); // blocked unless it's the target itself (solid)
+    }
+    return true;
+}
+
 // ---------------- Pathfinding ----------------
 struct PQE{ int f,g,r,c; };
 static std::vector<Pos> astar(const Map&m,Pos s,Pos t){
@@ -233,27 +214,18 @@ static std::vector<Pos> astar(const Map&m,Pos s,Pos t){
     std::vector<PQE> open; 
     std::unordered_map<long long,std::pair<int,int>> parent; std::unordered_set<long long> inOpen; std::unordered_map<long long,int> bestG;
     auto key=[&](int r,int c)->long long{ return ((long long)r<<32)^(unsigned)c; };
-    auto push=[&](int r,int c,int g){ PQE e{g+h(r,c),g,r,c}; open.push_back(e);
- std::push_heap(open.begin(),open.end(),cmp);
- inOpen.insert(key(r,c));
- };
+    auto push=[&](int r,int c,int g){ PQE e{g+h(r,c),g,r,c}; open.push_back(e); std::push_heap(open.begin(),open.end(),cmp); inOpen.insert(key(r,c)); };
     push(s.r,s.c,0); bestG[key(s.r,s.c)]=0;
     while(!open.empty()){
-        std::pop_heap(open.begin(),open.end(),cmp);
- PQE cur=open.back();
- open.pop_back();
- inOpen.erase(key(cur.r,cur.c));
-
+        std::pop_heap(open.begin(),open.end(),cmp); PQE cur=open.back(); open.pop_back(); inOpen.erase(key(cur.r,cur.c));
         if(cur.r==t.r && cur.c==t.c){ std::vector<Pos> path; long long k=key(t.r,t.c);
- while(true){ path.push_back({(int)(k>>32),(int)(k&0xffffffff)});
- auto it=parent.find(k);
- if(it==parent.end()) break; k=((long long)it->second.first<<32)^(unsigned)it->second.second; } std::reverse(path.begin(),path.end());
- return path; }
+            while(true){ path.push_back({(int)(k>>32),(int)(k&0xffffffff)}); auto it=parent.find(k); if(it==parent.end()) break; k=((long long)it->second.first<<32)^(unsigned)it->second.second; }
+            std::reverse(path.begin(),path.end()); return path;
+        }
         for(auto nb: neighbors4(cur.r,cur.c)){
             if(!m.walkable(nb.r,nb.c)) continue; int ng=cur.g+1; long long nk=key(nb.r,nb.c);
             auto it=bestG.find(nk);
- if(it==bestG.end()||ng<it->second){ bestG[nk]=ng; parent[nk]={cur.r,cur.c}; if(!inOpen.count(nk)) push(nb.r,nb.c,ng);
- }
+            if(it==bestG.end()||ng<it->second){ bestG[nk]=ng; parent[nk]={cur.r,cur.c}; if(!inOpen.count(nk)) push(nb.r,nb.c,ng); }
         }
     }
     return {};
@@ -283,7 +255,7 @@ static bool is_door_site(const Map&m,int r,int c){
 
 // ---------------- Items/Monsters ----------------
 static Item make_random_item(RNG&rng){
-    int t=rng.i(0, 17);
+    int t=rng.i(0,17);
     Item it{};
     switch(t){
         case 0: it.kind=ItemKind::PotionHeal; it.name="potion of healing"; it.glyph='!'; it.power=rng.i(4,9); break;
@@ -299,10 +271,11 @@ static Item make_random_item(RNG&rng){
         case 10: it.kind=ItemKind::SpellbookHeal; it.name="spellbook: Heal"; it.glyph='?'; break;
         case 11: it.kind=ItemKind::SpellbookBlink; it.name="spellbook: Blink"; it.glyph='?'; break;
         case 12: it.kind=ItemKind::SpellbookIce; it.name="spellbook: Ice Shard"; it.glyph='?'; break;
-        case 13: it.kind=ItemKind::ScrollMapping; it.name="scroll of mapping"; it.glyph='?'; break;
-        case 14: it.kind=ItemKind::Bomb; it.name="bomb"; it.glyph='o'; it.power=1; break;
-        case 15: it.kind=ItemKind::Key; it.name="small key"; it.glyph=';'; it.power=1; break;
-        default: it.kind=ItemKind::SpellbookShield; it.name="spellbook: Shield"; it.glyph='?'; break;
+        case 13: it.kind=ItemKind::SpellbookShield; it.name="spellbook: Shield"; it.glyph='?'; break;
+        case 14: it.kind=ItemKind::SpellbookFireball; it.name="spellbook: Fireball"; it.glyph='?'; break;
+        case 15: it.kind=ItemKind::ScrollBlink; it.name="scroll of blink"; it.glyph='?'; break;
+        case 16: it.kind=ItemKind::ScrollMapping; it.name="scroll of mapping"; it.glyph='?'; break;
+        case 17: it.kind=ItemKind::Bomb; it.name="bomb"; it.glyph='o'; it.power=1; break;
     } return it;
 }
 static std::string item_desc(const Item& it){
@@ -330,9 +303,8 @@ static Monster make_mon(RNG&rng,int level){
     m.glyph="mnbhkowzsWISGHsiCFBbwWaA"[rng.i(0,(int)std::string("mnbhkowzsWISGHsiCFBbwWaA").size()-1)];
     m.st.max_hp=m.st.hp=rng.i(5+level, 10+level*2);
     m.st.atk=rng.i(1+level/2, 3+level);
- m.st.def=rng.i(0,2+level/2);
- m.st.str=rng.i(6,12+level);
-
+    m.st.def=rng.i(0,2+level/2);
+    m.st.str=rng.i(6,12+level);
     m.ai=rng.chance(0.6)?AiKind::Hunter:AiKind::Wander; m.xp=4+level*2; m.speed= rng.i(70,130); m.energy=0; return m;
 }
 
@@ -342,68 +314,52 @@ static std::vector<Rect> generate_dungeon(Map& m,RNG& rng,std::string& biome){
     const char* biomes[]={"Crypt","Catacombs","Armory","Lava Caves","Sewers","Library"};
     biome=biomes[rng.i(0,5)];
     int rooms=rng.i(10,16); std::vector<Rect> R; int attempts=0;
+    int maxC = std::max(2, m.W - LEG_W - 2); // avoid legend area
     while((int)R.size()<rooms && attempts<350){
         attempts++; int h=rng.i(4,7), w=rng.i(5,11);
- int r=rng.i(1,m.H-h-2), c=rng.i(1,m.W-w-2);
-
+        int r=rng.i(1,m.H-h-2), c=rng.i(1, std::max(1, maxC - w));
         Rect t{r,c,h,w}; bool ok=true; for(auto&q:R) if(rect_overlap(t,q)){ok=false;break;} if(!ok) continue; R.push_back(t);
     }
     for(auto&q:R) carve_room(m,q);
     std::vector<Pos> centers; for(auto&q:R) centers.push_back(center(q));
-    std::vector<int> order(centers.size());
- for(size_t i=0;i<order.size();
-i++) order[i]=(int)i; std::shuffle(order.begin(),order.end(),rng.eng);
-
-    for(size_t i=1;i<order.size();
-i++){ Pos a=centers[order[i-1]], b=centers[order[i]]; if(rng.chance(0.5)){carve_h(m,a.r,a.c,b.c);
- carve_v(m,b.c,a.r,b.r);
-} else {carve_v(m,a.c,a.r,b.r);
- carve_h(m,b.r,a.c,b.c);
-} }
+    std::vector<int> order(centers.size()); for(size_t i=0;i<order.size();i++) order[i]=(int)i; std::shuffle(order.begin(),order.end(),rng.eng);
+    for(size_t i=1;i<order.size();i++){
+        Pos a=centers[order[i-1]], b=centers[order[i]];
+        if(rng.chance(0.5)){carve_h(m,a.r,a.c,std::min(b.c,maxC-1)); carve_v(m,std::min(b.c,maxC-1),a.r,b.r);}
+        else {carve_v(m,std::min(a.c,maxC-1),a.r,b.r); carve_h(m,b.r,a.c,std::min(b.c,maxC-1));}
+    }
     if(!R.empty()){ Pos s=center(R.back()); m.at(s.r,s.c).t=Tile::Teleporter; }
-    for(int r=1;r<m.H-1;r++) for(int c=1;c<m.W-1;c++){ if(is_door_site(m,r,c) && rng.chance(0.35)) m.at(r,c).t=Tile::DoorClosed; }
+    for(int r=1;r<m.H-1;r++) for(int c=1;c<maxC-1;c++){ if(is_door_site(m,r,c) && rng.chance(0.35)) m.at(r,c).t=Tile::DoorClosed; }
     double trap_rate=(biome=="Lava Caves"?0.08: biome=="Catacombs"?0.05: 0.04);
-    for(int r=1;r<m.H-1;r++) for(int c=1;c<m.W-1;c++){ if(m.at(r,c).t==Tile::Floor && rng.chance(trap_rate)) m.at(r,c).t=Tile::TrapHidden; }
+    for(int r=1;r<m.H-1;r++) for(int c=1;c<maxC-1;c++){ if(m.at(r,c).t==Tile::Floor && rng.chance(trap_rate)) m.at(r,c).t=Tile::TrapHidden; }
     return R;
 }
 static void place_player(Game& g,const std::vector<Rect>& rooms){ g.player.pos=rooms.empty()? Pos{1,1}: center(rooms.front()); }
 static void place_mobs_items_chests(Game& g,const std::vector<Rect>& rooms){
     for(size_t i=1;i<rooms.size();i++){
         Pos p=center(rooms[i]);
-        if(g.rng.chance(0.80)){ Entity e{}; e.type=EntityType::Mob; e.pos=p; e.mob=make_mon(g.rng,g.level);
- g.ents.push_back(e);
- }
-        if(g.rng.chance(0.65)){ Entity it{}; it.type=EntityType::ItemEntity; it.blocks=false; it.pos={p.r+g.rng.i(-1,1), p.c+g.rng.i(-1,1)}; if(!g.map.in(it.pos.r,it.pos.c)||!g.map.walkable(it.pos.r,it.pos.c)) it.pos=p; it.item=make_random_item(g.rng);
- g.ents.push_back(it);
- }
-        if(g.rng.chance(0.45)){ Entity ch{}; ch.type=EntityType::Chest; ch.blocks=false; ch.pos=p; ch.chest.locked=g.rng.chance(0.65);
- ch.chest.opened=false; ch.chest.content=make_random_item(g.rng);
- g.ents.push_back(ch);
- }
+        if(g.rng.chance(0.80)){ Entity e{}; e.type=EntityType::Mob; e.pos=p; e.mob=make_mon(g.rng,g.level); g.ents.push_back(e); }
+        if(g.rng.chance(0.65)){ Entity it{}; it.type=EntityType::ItemEntity; it.blocks=false; it.pos={p.r+g.rng.i(-1,1), p.c+g.rng.i(-1,1)}; if(!g.map.in(it.pos.r,it.pos.c)||!g.map.walkable(it.pos.r,it.pos.c)) it.pos=p; it.item=make_random_item(g.rng); g.ents.push_back(it); }
+        if(g.rng.chance(0.45)){ Entity ch{}; ch.type=EntityType::Chest; ch.blocks=false; ch.pos=p; ch.chest.locked=g.rng.chance(0.65); ch.chest.opened=false; ch.chest.content=make_random_item(g.rng); g.ents.push_back(ch); }
     }
 }
 
 // ---------------- Combat/Status ----------------
-static int roll_damage(RNG&rng,int atk,int def){ int base=std::max(0,atk-def);
- int var=rng.i(0,2);
- return std::max(0,base+var);
- }
+static int roll_damage(RNG&rng,int atk,int def){ int base=std::max(0,atk-def); int var=rng.i(0,2); return std::max(0,base+var); }
 static void apply_status_tick(Game& g, Stats& st, bool is_player){
     if(st.burning>0){ st.hp-=1; st.burning--; if(is_player) g.log.add("You are burning!"); }
     if(st.poison>0){ st.hp-=1; st.poison--; if(is_player) g.log.add("You suffer poison."); }
-    if(st.regen>0){ st.hp=std::min(st.max_hp, st.hp+1);
- st.regen--; if(is_player) g.log.add("You regenerate.");
- }
+    if(st.regen>0){ st.hp=std::min(st.max_hp, st.hp+1); st.regen--; if(is_player) g.log.add("You regenerate."); }
     if(st.snared>0){ st.snared--; }
     if(st.shield>0){ st.shield--; }
 }
 static void process_statuses(Game& g){
     apply_status_tick(g,g.player.mob.st,true);
-    for(auto& e: g.ents) if(e.type==EntityType::Mob && e.mob.alive){ int before=e.mob.st.hp; apply_status_tick(g,e.mob.st,false);
- if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies from ailments.");
- } }
+    for(auto& e: g.ents) if(e.type==EntityType::Mob && e.mob.alive){ int before=e.mob.st.hp; (void)before; apply_status_tick(g,e.mob.st,false);
+        if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies from ailments."); }
+    }
 }
-static void grant_xp(Game& g,int amt){ g.xp += amt; g.log.add("You gain "+std::to_string(amt)+" XP."); level_up(g); }
+static void grant_xp(Game& g,int amt){ g.xp += amt; g.log.add("You gain "+std::to_string(amt)+" XP."); }
 static int xp_to_next(int plv){ return 10 + plv*10; }
 static void level_up(Game& g){
     while(g.xp >= xp_to_next(g.plv)){
@@ -411,12 +367,9 @@ static void level_up(Game& g){
         g.player.mob.st.max_hp += 2; g.player.mob.st.hp = g.player.mob.st.max_hp;
         g.player.mob.st.atk += 1; g.player.mob.st.max_mp += 1; g.player.mob.st.mp = g.player.mob.st.max_mp;
         g.log.add("Level up! You are now level "+std::to_string(g.plv)+".");
-        // 25% chance to learn a random spell
         if(g.rng.chance(0.25)){
             SpellKind s = (SpellKind)g.rng.i(0,4);
-            if(!g.inv.knows(s)){ g.inv.learn(s);
- g.log.add("You intuit a new spell.");
- }
+            if(!g.inv.knows(s)){ g.inv.learn(s); g.log.add("You intuit a new spell."); }
         }
     }
 }
@@ -424,13 +377,11 @@ static void level_up(Game& g){
 static void attack(Game& g, Entity& A, Entity& B, const std::string& aname, const std::string& bname){
     int atk = A.mob.st.atk;
     int def = B.mob.st.def;
-    // player weapon bonus
     if(A.type==EntityType::Player && g.inv.weapon_idx>=0 && g.inv.weapon_idx<(int)g.inv.items.size()){
         const Item& w = g.inv.items[g.inv.weapon_idx];
         if(w.kind==ItemKind::Dagger) atk += 2;
         if(w.kind==ItemKind::Sword) atk += 4;
     }
-    // armor reduces damage passively (already in def), but if player has armor equipped, increase def
     if(B.type==EntityType::Player && g.inv.armor_idx>=0 && g.inv.armor_idx<(int)g.inv.items.size()){
         const Item& ar = g.inv.items[g.inv.armor_idx];
         if(ar.kind==ItemKind::ArmorLeather) def += 1;
@@ -449,95 +400,48 @@ static void pickup(Game& g){
     for(size_t i=0;i<g.ents.size();++i){
         auto&e=g.ents[i];
         if(e.type==EntityType::ItemEntity && e.pos==g.player.pos){
-            if(e.item.kind==ItemKind::Key && g.opt.auto_pickup_keys){ g.inv.keys++; g.log.add("Picked up a key.");
- g.ents.erase(g.ents.begin()+i);
- return; }
-            g.inv.items.push_back(e.item);
- g.log.add("Picked up: "+e.item.name+" ("+item_desc(e.item)+")");
- g.ents.erase(g.ents.begin()+i);
- return;
+            if(e.item.kind==ItemKind::Key && g.opt.auto_pickup_keys){ g.inv.keys++; g.log.add("Picked up a key."); g.ents.erase(g.ents.begin()+i); return; }
+            g.inv.items.push_back(e.item); g.log.add("Picked up: "+e.item.name+" ("+item_desc(e.item)+")"); g.ents.erase(g.ents.begin()+i); return;
         }
     } g.log.add("Nothing here to pick up.");
 }
 static void use_item(Game& g,int idx){
     if(idx<0||idx>=(int)g.inv.items.size()) return; auto it=g.inv.items[idx];
     switch(it.kind){
-        case ItemKind::PotionHeal:{ int before=g.player.mob.st.hp; g.player.mob.st.hp=std::min(g.player.mob.st.max_hp,g.player.mob.st.hp+it.power);
- g.log.add("You heal "+std::to_string(g.player.mob.st.hp-before)+" HP.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
-        case ItemKind::PotionStr:{ g.player.mob.st.str+=it.power; g.player.mob.st.atk+=it.power/2; g.player.mob.st.max_hp+=it.power; g.player.mob.st.hp=std::min(g.player.mob.st.hp+it.power,g.player.mob.st.max_hp);
- g.log.add("You feel stronger!");
- g.inv.items.erase(g.inv.items.begin()+idx);
- if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
-        case ItemKind::PotionAntidote:{ g.player.mob.st.poison=0; g.log.add("Poison cured.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
-        case ItemKind::PotionRegen:{ g.player.mob.st.regen += it.power; g.log.add("You begin regenerating.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
+        case ItemKind::PotionHeal:{ int before=g.player.mob.st.hp; g.player.mob.st.hp=std::min(g.player.mob.st.max_hp,g.player.mob.st.hp+it.power); g.log.add("You heal "+std::to_string(g.player.mob.st.hp-before)+" HP."); g.inv.items.erase(g.inv.items.begin()+idx); if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
+        case ItemKind::PotionStr:{ g.player.mob.st.str+=it.power; g.player.mob.st.atk+=it.power/2; g.player.mob.st.max_hp+=it.power; g.player.mob.st.hp=std::min(g.player.mob.st.hp+it.power,g.player.mob.st.max_hp); g.log.add("You feel stronger!"); g.inv.items.erase(g.inv.items.begin()+idx); if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
+        case ItemKind::PotionAntidote:{ g.player.mob.st.poison=0; g.log.add("Poison cured."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::PotionRegen:{ g.player.mob.st.regen += it.power; g.log.add("You begin regenerating."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
         case ItemKind::Dagger: case ItemKind::Sword:{ g.inv.weapon_idx=idx; g.log.add("You wield: "+it.name+" (+"+std::to_string(it.power)+")"); }break;
         case ItemKind::ArmorLeather: case ItemKind::ArmorChain:{ g.inv.armor_idx=idx; g.log.add("You don: "+it.name+" (+"+std::to_string(it.power)+")"); }break;
         case ItemKind::Key:{ g.log.add("A key. Use it on a chest with 'o'."); }break;
-        case ItemKind::Bomb:{
-            // place a timed bomb on the ground (fuse 2 turns)
-            Entity b{}; b.type=EntityType::BombPlaced; b.blocks=false; b.pos=g.player.pos; b.fuse=2;
-            g.ents.push_back(b);
-            g.inv.items.erase(g.inv.items.begin()+idx);
-            if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1;
-            if(g.inv.armor_idx==idx) g.inv.armor_idx=-1;
-        }break;
-        case ItemKind::ScrollMapping:{ for(int r=0;r<g.map.H;r++) for(int c=0;c<g.map.W;c++){ if(g.map.at(r,c).t!=Tile::Wall) g.map.at(r,c).seen=true; } g.log.add("You read the map.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
-        case ItemKind::SpellbookFirebolt:{ g.inv.learn(SpellKind::Firebolt);
- g.log.add("Learned Firebolt.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
-        case ItemKind::SpellbookHeal:{ g.inv.learn(SpellKind::Heal);
- g.log.add("Learned Heal.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
-        case ItemKind::SpellbookBlink:{ g.inv.learn(SpellKind::Blink);
- g.log.add("Learned Blink.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
-        case ItemKind::SpellbookIce:{ g.inv.learn(SpellKind::IceShard);
- g.log.add("Learned Ice Shard.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
-        case ItemKind::SpellbookShield:{ g.inv.learn(SpellKind::Shield);
- g.log.add("Learned Shield.");
- g.inv.items.erase(g.inv.items.begin()+idx);
- }break;
+        case ItemKind::Bomb:{ Entity b{}; b.type=EntityType::BombPlaced; b.blocks=false; b.pos=g.player.pos; b.fuse=2; g.ents.push_back(b); g.inv.items.erase(g.inv.items.begin()+idx); if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
+        case ItemKind::ScrollMapping:{ for(int r=0;r<g.map.H;r++) for(int c=0;c<g.map.W;c++){ if(g.map.at(r,c).t!=Tile::Wall) g.map.at(r,c).seen=true; } g.log.add("You read the map."); g.inv.items.erase(g.inv.items.begin()+idx); if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1; }break;
+        case ItemKind::SpellbookFirebolt:{ g.inv.learn(SpellKind::Firebolt); g.log.add("Learned Firebolt."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::SpellbookHeal:{ g.inv.learn(SpellKind::Heal); g.log.add("Learned Heal."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::SpellbookBlink:{ g.inv.learn(SpellKind::Blink); g.log.add("Learned Blink."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::SpellbookIce:{ g.inv.learn(SpellKind::IceShard); g.log.add("Learned Ice Shard."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::SpellbookShield:{ g.inv.learn(SpellKind::Shield); g.log.add("Learned Shield."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
+        case ItemKind::SpellbookFireball:{ g.inv.learn(SpellKind::Fireball); g.log.add("Learned Fireball."); g.inv.items.erase(g.inv.items.begin()+idx); }break;
         case ItemKind::ScrollBlink:{
             std::vector<Pos> spots; for(int r=0;r<g.map.H;r++) for(int c=0;c<g.map.W;c++) if(g.map.at(r,c).visible && g.map.walkable(r,c) && !(g.player.pos.r==r && g.player.pos.c==c)) spots.push_back({r,c});
-            if(spots.empty()) g.log.add("Blink fails.");
- else { g.player.pos=spots[g.rng.i(0,(int)spots.size()-1)]; g.log.add("You blink.");
- }
+            if(spots.empty()) g.log.add("Blink fails."); else { g.player.pos=spots[g.rng.i(0,(int)spots.size()-1)]; g.log.add("You blink."); }
             g.inv.items.erase(g.inv.items.begin()+idx); if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1; if(g.inv.armor_idx==idx) g.inv.armor_idx=-1;
         }break;
     }
 }
 static void drop_item(Game& g,int idx){
-
     if(idx<0 || idx>=(int)g.inv.items.size()) return;
     Item it = g.inv.items[idx];
-    // can't drop onto teleporter or chest occupied tile (also checked by caller)
-    for(auto& e: g.ents){
-        if(e.pos==g.player.pos && (e.type==EntityType::Chest)){ g.log.add("Can't drop here."); return; }
-    }
-    Entity ent{}; ent.type=EntityType::ItemEntity; ent.blocks=false; ent.pos=g.player.pos; ent.item=it;
-    g.ents.push_back(ent);
+    for(auto& e: g.ents) if(e.pos==g.player.pos && (e.type==EntityType::Chest)){ g.log.add("Can't drop here."); return; }
+    Entity ent{}; ent.type=EntityType::ItemEntity; ent.blocks=false; ent.pos=g.player.pos; ent.item=it; g.ents.push_back(ent);
     g.inv.items.erase(g.inv.items.begin()+idx);
     if(g.inv.weapon_idx==idx) g.inv.weapon_idx=-1;
     if(g.inv.armor_idx==idx) g.inv.armor_idx=-1;
     if(g.inv.weapon_idx>idx) g.inv.weapon_idx--;
     if(g.inv.armor_idx>idx) g.inv.armor_idx--;
     g.log.add("Dropped "+it.name+".");
-
 }
-
 
 // ---------------- Doors/Traps/Chests ----------------
 static bool is_closed_door(const Map&m,int r,int c){ return m.in(r,c) && m.at(r,c).t==Tile::DoorClosed; }
@@ -559,9 +463,7 @@ static void explode_at(Game& g, int r, int c, int radius){
     }
     for(auto& e: g.ents){ if(e.type==EntityType::Mob && e.mob.alive && in_range(e.pos.r,e.pos.c)){
         int dmg = g.rng.i(3, 8);
- e.mob.st.hp -= dmg; if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" is blown apart.");
- grant_xp(g,e.mob.xp);
- g.kills[e.mob.name]++; }
+        e.mob.st.hp -= dmg; if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" is blown apart."); grant_xp(g,e.mob.xp); g.kills[e.mob.name]++; }
     }}
     for(int rr=r-1; rr<=r+1; ++rr) for(int cc=c-1; cc<=c+1; ++cc){ if(g.map.in(rr,cc) && g.map.at(rr,cc).t==Tile::SecretWall){ g.map.at(rr,cc).t = Tile::DoorOpen; g.map.at(rr,cc).seen=true; g.log.add("A secret wall crumbles!"); } }
 }
@@ -569,15 +471,12 @@ static void trigger_trap(Game& g,int r,int c){
     g.map.at(r,c).t=Tile::TrapRevealed;
     TrapKind tk=trap_kind_for_biome(g.biome,g.rng);
     switch(tk){
-        case TrapKind::Spike:{ int dmg=g.rng.i(2,6);
- g.player.mob.st.hp-=dmg; g.log.add("A spike trap! You take "+std::to_string(dmg)+" damage.");
- }break;
+        case TrapKind::Spike:{ int dmg=g.rng.i(2,6); g.player.mob.st.hp-=dmg; g.log.add("A spike trap! You take "+std::to_string(dmg)+" damage."); }break;
         case TrapKind::Fire:{ g.player.mob.st.burning+=3; g.log.add("A fire trap! You are burning."); }break;
         case TrapKind::Snare:{ g.player.mob.st.snared+=2; g.log.add("A snare! You're entangled."); }break;
         case TrapKind::Poison:{ g.player.mob.st.poison+=4; g.log.add("Poison darts! You are poisoned."); }break;
         case TrapKind::Teleport:{ std::vector<Pos> spots; for(int rr=0;rr<g.map.H;rr++) for(int cc=0;cc<g.map.W;cc++) if(g.map.walkable(rr,cc)) spots.push_back({rr,cc});
- if(!spots.empty()){ g.player.pos = spots[g.rng.i(0,(int)spots.size()-1)]; g.log.add("A teleport trap warps you!");
- } }break;
+            if(!spots.empty()){ g.player.pos = spots[g.rng.i(0,(int)spots.size()-1)]; g.log.add("A teleport trap warps you!"); } }break;
         case TrapKind::Explosive:{ explode_at(g,r,c,2); }break;
     }
 }
@@ -598,12 +497,9 @@ static void open_chest(Game& g){
     for(size_t i=0;i<g.ents.size();++i){
         auto&e=g.ents[i]; if(e.type==EntityType::Chest && e.pos==g.player.pos){
             if(e.chest.opened){ g.log.add("The chest is empty."); return; }
-            if(e.chest.locked){ if(g.inv.keys>0){ g.inv.keys--; e.chest.locked=false; g.log.add("You unlock the chest.");
- } else { g.log.add("Locked. You need a key.");
- return; } }
+            if(e.chest.locked){ if(g.inv.keys>0){ g.inv.keys--; e.chest.locked=false; g.log.add("You unlock the chest."); } else { g.log.add("Locked. You need a key."); return; } }
             e.chest.opened=true; Entity it{}; it.type=EntityType::ItemEntity; it.blocks=false; it.pos=e.pos; it.item=e.chest.content; g.ents.push_back(it);
- g.log.add("You open the chest.");
- return;
+            g.log.add("You open the chest."); return;
         }
     } g.log.add("No chest here.");
 }
@@ -617,9 +513,7 @@ static void search(Game& g){
         if(g.map.in(nb.r,nb.c) && g.map.at(nb.r,nb.c).t==Tile::TrapHidden && g.rng.chance(0.5)){ g.map.at(nb.r,nb.c).t=Tile::TrapRevealed; found++; }
         if(is_closed_door(g.map,nb.r,nb.c) && g.rng.chance(0.25)){ g.log.add("You listen at a door."); }
     }
-    if(found>0) g.log.add("You discover "+std::to_string(found)+" trap(s)!");
- else g.log.add("You find nothing.");
-
+    if(found>0) g.log.add("You discover "+std::to_string(found)+" trap(s)!"); else g.log.add("You find nothing.");
 }
 
 // --- Color helpers (ANSI) ---
@@ -670,10 +564,8 @@ static Entity* chest_at(Game& g,int r,int c){ for(auto& e:g.ents) if(e.type==Ent
 static Entity* item_at(Game& g,int r,int c){ for(auto& e:g.ents) if(e.type==EntityType::ItemEntity && e.pos.r==r && e.pos.c==c) return &e; return nullptr; }
 
 static void draw_hud(const Game& g){
-
     io::move(g.map.H-4,0);
     int armor=(g.inv.armor_idx>=0 && g.inv.armor_idx<(int)g.inv.items.size())? g.inv.items[g.inv.armor_idx].power:0;
-
     std::ostringstream stats;
     stats<<"HP "<<g.player.mob.st.hp<<"/"<<g.player.mob.st.max_hp
          <<"  MP "<<g.player.mob.st.mp<<"/"<<g.player.mob.st.max_mp
@@ -682,34 +574,26 @@ static void draw_hud(const Game& g){
          <<"  STR "<<g.player.mob.st.str
          <<"  L"<<g.level<<"/"<<g.max_level<<" ["<<g.biome<<"]"
          <<"  Keys:"<<g.inv.keys
+         <<"  Gold "<<g.gold
          <<"  PLv "<<g.plv<<" XP "<<g.xp<<"/"<<xp_to_next(g.plv);
-
     std::string stats_row = stats.str();
-
     std::string help = "  (i)nven (g)get (s)earch (o)pen (z)cast (m)ap (X)codex (c)har (O)ptions (>)down (?)help (t)trade (q)save+quit";
     int W = g.map.W;
     std::string row = stats_row;
     int remain = W - (int)row.size();
     if(remain > 0){
-        // append truncated help to fit
         if((int)help.size() > remain) help.resize(remain);
         row += help;
     } else if((int)row.size() > W){
         row.resize(W);
     }
     std::cout<< std::left << std::setw(W) << row;
-
 }
-
 
 static void render(Game& g){
     RenderBuf rb(g.map.H,g.map.W);
-    // legend sidebar width
-    const int LEG_W = 20;
     int viewW = g.map.W - LEG_W;
     int viewH = std::max(8, g.map.H - 4);
-
-    // camera follow
     if(g.cam_follow){
         g.cam_r = g.player.pos.r - viewH/2;
         g.cam_c = g.player.pos.c - viewW/2;
@@ -718,7 +602,6 @@ static void render(Game& g){
     if(g.cam_c < 0) g.cam_c = 0;
     if(g.cam_r > g.map.H - viewH) g.cam_r = std::max(0, g.map.H - viewH);
     if(g.cam_c > g.map.W - viewW) g.cam_c = std::max(0, g.map.W - viewW);
-
     int legend_x = viewW; // screen column where legend starts
 
     // draw map tiles (viewport)
@@ -749,31 +632,25 @@ static void render(Game& g){
         }
     }
 
-    // entities: items/chests/mobs/player in viewport coords
     auto in_view = [&](int r,int c){ return r>=g.cam_r && r<g.cam_r+viewH && c>=g.cam_c && c<g.cam_c+viewW; };
     auto to_screen = [&](int r,int c){ return Pos{ r - g.cam_r, c - g.cam_c }; };
 
-    
-    
     // bombs
     for(auto& e: g.ents){
-        if(e.type==EntityType::BombPlaced){
-            if(in_view(e.pos.r,e.pos.c)){
-                Pos s = to_screen(e.pos.r,e.pos.c);
-                rb.set(s.r,s.c,'o', Color::Item);
-            }
+        if(e.type==EntityType::BombPlaced && in_view(e.pos.r,e.pos.c)){
+            Pos s = to_screen(e.pos.r,e.pos.c);
+            rb.set(s.r,s.c,'o', Color::Item);
         }
     }
-// merchants
+    // merchants
     for(auto& e: g.ents){
-        if(e.type==EntityType::Merchant){
-            if(in_view(e.pos.r,e.pos.c)){
-                Pos s = to_screen(e.pos.r,e.pos.c);
-                rb.set(s.r,s.c,'$', Color::Item);
-            }
+        if(e.type==EntityType::Merchant && in_view(e.pos.r,e.pos.c)){
+            Pos s = to_screen(e.pos.r,e.pos.c);
+            rb.set(s.r,s.c,'$', Color::Item);
         }
     }
-for(auto& e: g.ents){
+    // items/chests
+    for(auto& e: g.ents){
         if(e.type==EntityType::ItemEntity){
             if(in_view(e.pos.r,e.pos.c) && g.map.at(e.pos.r,e.pos.c).visible){
                 Pos s = to_screen(e.pos.r,e.pos.c);
@@ -786,6 +663,7 @@ for(auto& e: g.ents){
             }
         }
     }
+    // mobs
     for(auto& e: g.ents){
         if(e.type==EntityType::Mob && e.mob.alive && in_view(e.pos.r,e.pos.c)){
             if(g.map.at(e.pos.r,e.pos.c).visible){
@@ -794,12 +672,12 @@ for(auto& e: g.ents){
             }
         }
     }
+    // player
     if(in_view(g.player.pos.r,g.player.pos.c)){
         Pos s = to_screen(g.player.pos.r,g.player.pos.c);
         rb.set(s.r,s.c,'@', Color::Player);
     }
 
-    
     // burning zones overlay
     for(size_t i=0;i<g.firezones.size();++i){
         Pos ez = g.firezones[i];
@@ -808,7 +686,7 @@ for(auto& e: g.ents){
             rb.set(s.r,s.c,'~', Color::Trap);
         }
     }
-// legend panel
+    // legend panel
     for(int r=0;r<g.map.H;r++){
         rb.set(r, legend_x, '|', Color::Legend);
         for(int c=legend_x+1;c<g.map.W;c++){ rb.set(r,c,' ', Color::Legend); }
@@ -842,7 +720,6 @@ for(auto& e: g.ents){
     io::flush();
 }
 static void show_help(){
-
     io::move(0,0); io::clear();
     std::cout<<"Help\n";
     std::cout<<"Move: arrows or W/A/D (S=down). '.' wait\n";
@@ -853,12 +730,9 @@ static void show_help(){
     std::cout<<"Opening menus (inventory/map/codex/options/help) doesn't pass time.\n";
     std::cout<<"Press any key...\n";
     io::flush(); (void)io::getch_blocking();
-
 }
 
-
 static void inventory_modal(Game& g){
-
     while(true){
         io::move(0,0);
         io::clear();
@@ -879,7 +753,6 @@ static void inventory_modal(Game& g){
             std::cout<<"\nDrop which? (letter) > "<<std::flush;
             int x=io::getch_blocking(); int idx=x-'a';
             if(idx>=0 && idx<(int)g.inv.items.size()){
-                // don't drop if tile already has item or chest
                 bool blocked=false;
                 for(auto& e: g.ents){
                     if(e.pos==g.player.pos && (e.type==EntityType::ItemEntity || e.type==EntityType::Chest)){ blocked=true; break; }
@@ -888,6 +761,8 @@ static void inventory_modal(Game& g){
                 else{
                     drop_item(g,idx);
                     // turn passes when you drop
+                    // (handled by caller: we call ai/status/tick here to be consistent)
+                    extern void ai_turn(Game&); extern void process_statuses(Game&); extern void world_tick(Game&);
                     ai_turn(g); process_statuses(g); world_tick(g);
                 }
             }
@@ -897,17 +772,15 @@ static void inventory_modal(Game& g){
         if(idx>=0 && idx<(int)g.inv.items.size()){
             use_item(g,idx);
             // turn passes on use
+            extern void ai_turn(Game&); extern void process_statuses(Game&); extern void world_tick(Game&);
             ai_turn(g); process_statuses(g); world_tick(g);
         }
     }
-
 }
 
 static void options_modal(Game& g){
     while(true){
-        io::move(0,0);
- io::clear();
-
+        io::move(0,0); io::clear();
         std::cout<<"Options:\n";
         std::cout<<"  1) Auto open door on bump: "<<(g.opt.auto_open_on_bump?"ON":"OFF")<<"\n";
         std::cout<<"  2) Auto pickup keys: "<<(g.opt.auto_pickup_keys?"ON":"OFF")<<"\n";
@@ -918,33 +791,23 @@ static void options_modal(Game& g){
     }
 }
 static void character_modal(Game& g){
-    io::move(0,0);
- io::clear();
-
+    io::move(0,0); io::clear();
     auto& st=g.player.mob.st; int armor=(g.inv.armor_idx>=0 && g.inv.armor_idx<(int)g.inv.items.size())? g.inv.items[g.inv.armor_idx].power:0;
     std::cout<<"Character Sheet\n\n";
     std::cout<<"Level: "<<g.plv<<"  XP: "<<g.xp<<"/"<<xp_to_next(g.plv)<<"\n";
     std::cout<<"HP: "<<st.hp<<"/"<<st.max_hp<<"   MP: "<<st.mp<<"/"<<st.max_mp<<"\n";
     std::cout<<"ATK: "<<st.atk<<"   DEF: "<<st.def+armor+(st.shield>0?2:0)<<"   STR: "<<st.str<<"\n";
     std::cout<<"Statuses: burn "<<st.burning<<", poison "<<st.poison<<", regen "<<st.regen<<", snare "<<st.snared<<", shield "<<st.shield<<"\n\n";
-    std::cout<<"Press any key...\n"; io::flush();
- (void)io::getch_blocking();
-
+    std::cout<<"Press any key...\n"; io::flush(); (void)io::getch_blocking();
 }
 static void codex_modal(Game& g){
-    io::move(0,0);
- io::clear();
-
+    io::move(0,0); io::clear();
     std::cout<<"Codex (kills):\n";
     if(g.kills.empty()) std::cout<<"  (empty)\n"; else { for(auto& kv: g.kills) std::cout<<"  "<<kv.first<<": "<<kv.second<<"\n"; }
-    std::cout<<"\nPress any key...\n"; io::flush();
- (void)io::getch_blocking();
-
+    std::cout<<"\nPress any key...\n"; io::flush(); (void)io::getch_blocking();
 }
 static void map_modal(Game& g){
-
-    io::move(0,0);
-    io::clear();
+    io::move(0,0); io::clear();
     RenderBuf rb(g.map.H,g.map.W);
     for(int r=0;r<g.map.H;r++){
         for(int c=0;c<g.map.W;c++){
@@ -957,7 +820,6 @@ static void map_modal(Game& g){
             }
         }
     }
-    // chests on seen tiles
     for(auto& e: g.ents){
         if(e.type==EntityType::Chest){
             if(g.map.at(e.pos.r,e.pos.c).seen){
@@ -965,19 +827,18 @@ static void map_modal(Game& g){
             }
         }
     }
-    // player position
     rb.set(g.player.pos.r,g.player.pos.c,'@', Color::Player);
     io::clear();
     rb.flush();
     std::cout << "\n(Seen map) Press any key...\n";
     io::flush();
     (void)io::getch_blocking();
-
 }
+
 static int to_int(Tile t){ return (int)t; } static Tile to_tile(int v){ return (Tile)v; }
 static void save_game(const Game& g){
     std::ofstream f("savegame.txt"); if(!f) return;
-    f<<"LEVEL "<<g.level<<" "<<g.map.H<<" "<<g.map.W<<" "<<g.plv<<" "<<g.xp<<" "<<g.opt.auto_open_on_bump<<" "<<g.opt.auto_pickup_keys<<"\n";
+    f<<"LEVEL "<<g.level<<" "<<g.map.H<<" "<<g.map.W<<" "<<g.plv<<" "<<g.xp<<" "<<g.opt.auto_open_on_bump<<" "<<g.opt.auto_pickup_keys<<" "<<g.gold<<"\n";
     f<<"PR "<<g.player.pos.r<<" "<<g.player.pos.c<<" "<<g.player.mob.st.hp<<" "<<g.player.mob.st.max_hp<<" "<<g.player.mob.st.atk<<" "<<g.player.mob.st.def<<" "<<g.player.mob.st.str<<" "<<g.player.mob.st.mp<<" "<<g.player.mob.st.max_mp<<" "<<g.player.mob.st.burning<<" "<<g.player.mob.st.snared<<" "<<g.player.mob.st.poison<<" "<<g.player.mob.st.regen<<" "<<g.player.mob.st.shield<<"\n";
     f<<"IN "<<g.inv.keys<<" "<<g.inv.weapon_idx<<" "<<g.inv.armor_idx<<" "<<g.inv.items.size()<<"\n";
     for(auto& it: g.inv.items) f<<"IT "<<(int)it.kind<<" "<<it.name<<"| "<<(int)it.glyph<<" "<<it.power<<"\n";
@@ -991,6 +852,10 @@ static void save_game(const Game& g){
             f<<"ITM "<<e.pos.r<<" "<<e.pos.c<<" "<<(int)e.item.kind<<" "<<e.item.name<<"| "<<(int)e.item.glyph<<" "<<e.item.power<<"\n";
         } else if(e.type==EntityType::Chest){
             f<<"CHS "<<e.pos.r<<" "<<e.pos.c<<" "<<(int)e.chest.locked<<" "<<(int)e.chest.opened<<" "<<(int)e.chest.content.kind<<" "<<e.chest.content.name<<"| "<<(int)e.chest.content.glyph<<" "<<e.chest.content.power<<"\n";
+        } else if(e.type==EntityType::BombPlaced){
+            f<<"BMB "<<e.pos.r<<" "<<e.pos.c<<" "<<e.fuse<<"\n";
+        } else if(e.type==EntityType::Merchant){
+            f<<"MRC "<<e.pos.r<<" "<<e.pos.c<<"\n";
         }
     }
     f<<"MP "<<g.map.H<<"\n";
@@ -998,47 +863,27 @@ static void save_game(const Game& g){
 }
 static bool load_game(Game& g){
     std::ifstream f("savegame.txt"); if(!f) return false; std::string tag; int H,W;
-    f>>tag>>g.level>>H>>W>>g.plv>>g.xp>>g.opt.auto_open_on_bump>>g.opt.auto_pickup_keys; if(tag!="LEVEL") return false; g.map=Map(H,W);
+    f>>tag>>g.level>>H>>W>>g.plv>>g.xp>>g.opt.auto_open_on_bump>>g.opt.auto_pickup_keys>>g.gold; if(tag!="LEVEL") return false; g.map=Map(H,W);
     int r,c; f>>tag>>r>>c>>g.player.mob.st.hp>>g.player.mob.st.max_hp>>g.player.mob.st.atk>>g.player.mob.st.def>>g.player.mob.st.str>>g.player.mob.st.mp>>g.player.mob.st.max_mp>>g.player.mob.st.burning>>g.player.mob.st.snared>>g.player.mob.st.poison>>g.player.mob.st.regen>>g.player.mob.st.shield; g.player.pos={r,c};
-    int nitems; f>>tag>>g.inv.keys>>g.inv.weapon_idx>>g.inv.armor_idx>>nitems; g.inv.items.clear();
- std::string line; std::getline(f,line);
-
-    for(int i=0;i<nitems;i++){ std::getline(f,line);
- std::istringstream ss(line);
- std::string itag; ss>>itag; int kind,glyph,power; std::string namepipe; ss>>kind>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back();
- Item it; it.kind=(ItemKind)kind; it.name=namepipe; it.glyph=(char)glyph; it.power=power; g.inv.items.push_back(it);
- }
-    int nsp; f>>tag>>nsp; g.inv.spells.clear();
- for(int i=0;i<nsp;i++){ int s; f>>s; g.inv.spells.push_back((SpellKind)s);
- }
-    int nk; f>>tag>>nk; g.kills.clear();
- std::getline(f,line);
- for(int i=0;i<nk;i++){ std::getline(f,line);
- std::istringstream ss(line);
- std::string namepipe; int cnt; ss>>namepipe>>cnt; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back();
- g.kills[namepipe]=cnt; }
+    int nitems; f>>tag>>g.inv.keys>>g.inv.weapon_idx>>g.inv.armor_idx>>nitems; g.inv.items.clear(); std::string line; std::getline(f,line);
+    for(int i=0;i<nitems;i++){ std::getline(f,line); std::istringstream ss(line); std::string itag; ss>>itag; int kind,glyph,power; std::string namepipe; ss>>kind>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back(); Item it; it.kind=(ItemKind)kind; it.name=namepipe; it.glyph=(char)glyph; it.power=power; g.inv.items.push_back(it); }
+    int nsp; f>>tag>>nsp; g.inv.spells.clear(); for(int i=0;i<nsp;i++){ int s; f>>s; g.inv.spells.push_back((SpellKind)s); }
+    int nk; f>>tag>>nk; g.kills.clear(); std::getline(f,line);
+    for(int i=0;i<nk;i++){ std::getline(f,line); std::istringstream ss(line); std::string namepipe; int cnt; ss>>namepipe>>cnt; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back(); g.kills[namepipe]=cnt; }
     int nents; f>>tag>>nents; std::getline(f,line);
- g.ents.clear();
-
-    for(int i=0;i<nents;i++){ std::getline(f,line);
- std::istringstream ss(line);
- std::string et; ss>>et;
-        if(et=="MOB"){ Entity e{}; e.type=EntityType::Mob; int alive,glyph; ss>>e.pos.r>>e.pos.c>>alive; e.mob.alive=alive!=0; std::string namepipe; ss>>namepipe>>glyph>>e.mob.st.max_hp>>e.mob.st.hp>>e.mob.st.atk>>e.mob.st.def>>e.mob.st.str>>e.mob.xp; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back();
- e.mob.name=namepipe; e.mob.glyph=(char)glyph; g.ents.push_back(e);
- }
-        else if(et=="ITM"){ Entity e{}; e.type=EntityType::ItemEntity; e.blocks=false; int kind,glyph,power; ss>>e.pos.r>>e.pos.c>>kind; std::string namepipe; ss>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back();
- e.item.kind=(ItemKind)kind; e.item.name=namepipe; e.item.glyph=(char)glyph; e.item.power=power; g.ents.push_back(e);
- }
-        else if(et=="CHS"){ Entity e{}; e.type=EntityType::Chest; e.blocks=true; int locked,opened,kind,glyph,power; ss>>e.pos.r>>e.pos.c>>locked>>opened>>kind; std::string namepipe; ss>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back();
- e.chest.locked=locked!=0; e.chest.opened=opened!=0; e.chest.content.kind=(ItemKind)kind; e.chest.content.name=namepipe; e.chest.content.glyph=(char)glyph; e.chest.content.power=power; g.ents.push_back(e);
- }
+    g.ents.clear();
+    for(int i=0;i<nents;i++){
+        std::getline(f,line); std::istringstream ss(line); std::string et; ss>>et;
+        if(et=="MOB"){ Entity e{}; e.type=EntityType::Mob; int alive,glyph; ss>>e.pos.r>>e.pos.c>>alive; e.mob.alive=alive!=0; std::string namepipe; ss>>namepipe>>glyph>>e.mob.st.max_hp>>e.mob.st.hp>>e.mob.st.atk>>e.mob.st.def>>e.mob.st.str>>e.mob.xp; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back(); e.mob.name=namepipe; e.mob.glyph=(char)glyph; g.ents.push_back(e); }
+        else if(et=="ITM"){ Entity e{}; e.type=EntityType::ItemEntity; e.blocks=false; int kind,glyph,power; ss>>e.pos.r>>e.pos.c>>kind; std::string namepipe; ss>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back(); e.item.kind=(ItemKind)kind; e.item.name=namepipe; e.item.glyph=(char)glyph; e.item.power=power; g.ents.push_back(e); }
+        else if(et=="CHS"){ Entity e{}; e.type=EntityType::Chest; e.blocks=true; int locked,opened,kind,glyph,power; ss>>e.pos.r>>e.pos.c>>locked>>opened>>kind; std::string namepipe; ss>>namepipe>>glyph>>power; if(!namepipe.empty()&&namepipe.back()=='|') namepipe.pop_back(); e.chest.locked=locked!=0; e.chest.opened=opened!=0; e.chest.content.kind=(ItemKind)kind; e.chest.content.name=namepipe; e.chest.content.glyph=(char)glyph; e.chest.content.power=power; g.ents.push_back(e); }
+        else if(et=="BMB"){ Entity e{}; e.type=EntityType::BombPlaced; e.blocks=false; ss>>e.pos.r>>e.pos.c>>e.fuse; g.ents.push_back(e); }
+        else if(et=="MRC"){ Entity e{}; e.type=EntityType::Merchant; e.blocks=false; ss>>e.pos.r>>e.pos.c; g.ents.push_back(e); }
     }
     int Hhdr; f>>tag>>Hhdr; std::getline(f,line);
- for(int rr=0; rr<g.map.H; rr++){ std::getline(f,line);
- std::istringstream ss(line);
- for(int cc=0; cc<g.map.W; cc++){ int t,seen; ss>>t>>seen; g.map.at(rr,cc).t=to_tile(t);
- g.map.at(rr,cc).seen=(seen!=0);
- } }
+    for(int rr=0; rr<g.map.H; rr++){ std::getline(f,line); std::istringstream ss(line);
+        for(int cc=0; cc<g.map.W; cc++){ int t,seen; ss>>t>>seen; g.map.at(rr,cc).t=to_tile(t); g.map.at(rr,cc).seen=(seen!=0); }
+    }
     return true;
 }
 
@@ -1046,11 +891,8 @@ static bool load_game(Game& g){
 enum class CmdType{ Move,Wait,Pickup,Inventory,Descend,SaveQuit,NewGame,LoadGame,Help,Search,Open,Cast,Map,Codex,Char,Options,CamPan,CamToggle,Trade,None };
 struct Cmd{ CmdType type=CmdType::None; int dr=0,dc=0; };
 
-
 static Cmd read_cmd(){
     int ch = io::getch_blocking();
-
-    // common commands
     if(ch=='q') return {CmdType::SaveQuit,0,0};
     if(ch=='n') return {CmdType::NewGame,0,0};
     if(ch=='r') return {CmdType::LoadGame,0,0};
@@ -1058,7 +900,7 @@ static Cmd read_cmd(){
     if(ch=='.') return {CmdType::Wait,0,0};
     if(ch=='g') return {CmdType::Pickup,0,0};
     if(ch=='i') return {CmdType::Inventory,0,0};
-    if(ch=='s') return {CmdType::Search,0,0}; // keep 's' for search
+    if(ch=='s') return {CmdType::Search,0,0};
     if(ch=='o') return {CmdType::Open,0,0};
     if(ch=='z') return {CmdType::Cast,0,0};
     if(ch=='m') return {CmdType::Map,0,0};
@@ -1069,29 +911,25 @@ static Cmd read_cmd(){
     if(ch=='F') return {CmdType::CamToggle,0,0};
     if(ch=='>') return {CmdType::Descend,0,0};
 
-    // camera pan (free camera): HJKL
     if(ch=='H') return {CmdType::CamPan,0,-1};
     if(ch=='J') return {CmdType::CamPan,1,0};
     if(ch=='K') return {CmdType::CamPan,-1,0};
     if(ch=='L') return {CmdType::CamPan,0,1};
 
-    // movement by WASD (uppercase and lowercase), but keep 's' for Search (uppercase S moves down)
     if(ch=='w' || ch=='W') return {CmdType::Move,-1,0};
     if(ch=='a' || ch=='A') return {CmdType::Move,0,-1};
     if(ch=='d' || ch=='D') return {CmdType::Move,0,1};
     if(ch=='S') return {CmdType::Move,1,0};
 
 #ifdef _WIN32
-    // Windows: arrow keys come as 0 or 224 followed by code
     if(ch==0 || ch==224){
         int ch2 = io::getch_blocking();
-        if(ch2==72) return {CmdType::Move,-1,0}; // up
-        if(ch2==80) return {CmdType::Move, 1,0}; // down
-        if(ch2==75) return {CmdType::Move, 0,-1}; // left
-        if(ch2==77) return {CmdType::Move, 0, 1}; // right
+        if(ch2==72) return {CmdType::Move,-1,0};
+        if(ch2==80) return {CmdType::Move, 1,0};
+        if(ch2==75) return {CmdType::Move, 0,-1};
+        if(ch2==77) return {CmdType::Move, 0, 1};
     }
 #else
-    // POSIX: ESC [ A/B/C/D
     if(ch==27){
         int ch1 = io::getch_blocking();
         if(ch1=='['){
@@ -1106,8 +944,6 @@ static Cmd read_cmd(){
     return {CmdType::None,0,0};
 }
 
-
-
 static void move_or_attack(Game& g,int dr,int dc){
     if(g.player.mob.st.snared>0){ g.log.add("You are snared!"); return; }
     int nr=g.player.pos.r+dr, nc=g.player.pos.c+dc; if(!g.map.in(nr,nc)) return;
@@ -1117,18 +953,13 @@ static void move_or_attack(Game& g,int dr,int dc){
     if(g.map.walkable(nr,nc) && !occupied(g,nr,nc)) g.player.pos={nr,nc};
 }
 
-
-static void ai_turn(Game& g){
+void ai_turn(Game& g){
     for(auto& e: g.ents){
         if(e.type!=EntityType::Mob || !e.mob.alive) continue;
-        // accumulate energy
         e.mob.energy += e.mob.speed;
         int steps = 0;
         while(e.mob.energy >= 100 && steps < 3){
-            // snared: consume a turn doing nothing
             if(e.mob.st.snared>0){ e.mob.st.snared--; e.mob.energy -= 100; steps++; continue; }
-
-            // act
             if(e.mob.ai==AiKind::Wander){
                 int dir=g.rng.i(0,4); int dr[5]={-1,1,0,0,0}, dc[5]={0,0,-1,1,0}; int nr=e.pos.r+dr[dir], nc=e.pos.c+dc[dir];
                 if(g.player.pos.r==nr && g.player.pos.c==nc) attack(g,e,g.player,e.mob.name,"You");
@@ -1152,12 +983,9 @@ static void ai_turn(Game& g){
     }
 }
 
-
 // ---------------- Tips loader ----------------
 static void maybe_tip_from_file(Game& g){
-    std::ifstream f("tips.txt");
- if(!f) return; std::vector<std::string> tips; std::string s; while(std::getline(f,s)){ if(!s.empty()) tips.push_back(s);
- if(tips.size()>1000) break; }
+    std::ifstream f("tips.txt"); if(!f) return; std::vector<std::string> tips; std::string s; while(std::getline(f,s)){ if(!s.empty()) tips.push_back(s); if(tips.size()>1000) break; }
     if(!tips.empty() && g.rng.chance(0.35)) g.log.add(tips[g.rng.i(0,(int)tips.size()-1)]);
 }
 
@@ -1165,41 +993,35 @@ static void maybe_tip_from_file(Game& g){
 static void init_player(Game& g){ g.player.type=EntityType::Player; g.player.blocks=true; g.player.mob.name="You"; g.player.mob.glyph='@'; g.player.mob.st={20,20,3,1,10, 12,12, 0,0,0,0,0}; g.inv=Inventory{}; g.plv=1; g.xp=0; }
 static void add_secret_rooms(Game& g){
     int rooms = g.rng.i(1,2);
+    int maxC = std::max(2, g.map.W - LEG_W - 3);
     for(int k=0;k<rooms;k++){
         int h=g.rng.i(3,5), w=g.rng.i(3,5);
         int r=g.rng.i(2, g.map.H-h-3);
-        int c=g.rng.i(2, g.map.W-w-23);
+        int c=g.rng.i(2, std::max(2, maxC - w));
         bool ok=true;
         for(int rr=r-1; rr<r+h+1; rr++) for(int cc=c-1; cc<c+w+1; cc++){ if(!g.map.in(rr,cc) || g.map.at(rr,cc).t!=Tile::Wall){ ok=false; break; } if(!ok) break; }
         if(!ok) continue;
         for(int rr=r; rr<r+h; rr++) for(int cc=c; cc<c+w; cc++) g.map.at(rr,cc).t=Tile::Floor;
         for(int rr=r-1; rr<r+h+1; rr++){ g.map.at(rr,c-1).t=Tile::SecretWall; g.map.at(rr,c+w).t=Tile::SecretWall; }
         for(int cc=c-1; cc<c+w+1; cc++){ g.map.at(r-1,cc).t=Tile::SecretWall; g.map.at(r+h,cc).t=Tile::SecretWall; }
-        Entity ch{}; ch.type=EntityType::Chest; ch.blocks=false; ch.pos={r+h/2, c+w/2}; ch.chest.locked=g.rng.chance(0.5);
- ch.chest.opened=false; ch.chest.content=make_random_item(g.rng);
- g.ents.push_back(ch);
-
+        Entity ch{}; ch.type=EntityType::Chest; ch.blocks=false; ch.pos={r+h/2, c+w/2}; ch.chest.locked=g.rng.chance(0.5); ch.chest.opened=false; ch.chest.content=make_random_item(g.rng); g.ents.push_back(ch);
     }
 }
 
-static void new_level(Game& g){ g.ents.clear();
- auto rooms=generate_dungeon(g.map,g.rng,g.biome);
- place_player(g,rooms);
- place_mobs_items_chests(g,rooms);
-    // maybe place merchant near first room center
+static void new_level(Game& g){
+    g.ents.clear();
+    auto rooms=generate_dungeon(g.map,g.rng,g.biome);
+    place_player(g,rooms);
+    place_mobs_items_chests(g,rooms);
     if(g.rng.chance(0.25) && !rooms.empty()){
         Pos c{ rooms[0].r + rooms[0].h/2, rooms[0].c + rooms[0].w/2 };
         Entity m{}; m.type=EntityType::Merchant; m.blocks=false; m.pos=c;
         g.ents.push_back(m);
     }
-
-
     add_secret_rooms(g);
-    // record teleporter position
     g.teleporter = {-1,-1};
     for(int r=0;r<g.map.H;r++) for(int c=0;c<g.map.W;c++) if(g.map.at(r,c).t==Tile::Teleporter) g.teleporter = {r,c};
     if(g.teleporter.r<0 && !rooms.empty()){
-        // choose farthest room center from player
         Pos best = Pos{ rooms[0].r + rooms[0].h/2, rooms[0].c + rooms[0].w/2 };
         int bestd = -1;
         for(auto& R: rooms){
@@ -1209,8 +1031,6 @@ static void new_level(Game& g){ g.ents.clear();
         }
         if(g.map.walkable(best.r,best.c)){ g.map.at(best.r,best.c).t = Tile::Teleporter; g.teleporter = best; }
     }
-
-    // spawn boss near teleporter
     if(g.teleporter.r>=0){
         Entity boss{}; boss.type=EntityType::Mob; boss.blocks=true; boss.pos = {g.teleporter.r + (g.rng.i(0,1)?1:-1), g.teleporter.c};
         boss.mob.name="Guardian"; boss.mob.glyph='B'; boss.mob.st.max_hp=boss.mob.st.hp=28 + g.level*4;
@@ -1218,79 +1038,92 @@ static void new_level(Game& g){ g.ents.clear();
         boss.mob.ai=AiKind::Hunter; boss.mob.alive=true; boss.mob.xp=20 + g.level*5;
         if(g.map.walkable(boss.pos.r,boss.pos.c)) g.ents.push_back(boss);
     }
- g.log.add("You descend to level "+std::to_string(g.level)+" ["+g.biome+"].");
- maybe_tip_from_file(g);
- compute_fov(g.map,g.player.pos.r,g.player.pos.c,10);
- }
-static void next_level(Game& g){ if(g.level>=g.max_level){ g.log.add("You reach the bottom. Victory!");
- g.running=false; return; } g.level++; new_level(g);
- }
-static void new_game(Game& g){ g.level=1; init_player(g);
- new_level(g);
- g.log.add("Welcome!");
- }
-
-// ---------------- Main ----------------
+    g.log.add("You descend to level "+std::to_string(g.level)+" ["+g.biome+"].");
+    maybe_tip_from_file(g);
+    compute_fov(g.map,g.player.pos.r,g.player.pos.c,10);
+}
+static void next_level(Game& g){ if(g.level>=g.max_level){ g.log.add("You reach the bottom. Victory!"); g.running=false; return; } g.level++; new_level(g); }
+static void new_game(Game& g){ g.level=1; init_player(g); new_level(g); g.log.add("Welcome!"); }
 
 // ---------------- Spells ----------------
-static bool los_clear(const Map& m,Pos a,Pos b){
-    int r=a.r,c=a.c; int dr=(b.r>r?1:(b.r<r?-1:0)), dc=(b.c>c?1:(b.c<c?-1:0));
-    while(r!=b.r || c!=b.c){ r+=dr; c+=dc; if(opaque(m,r,c)) return false; }
-    return true;
-}
+static bool target_tile(Game& g,int range,Pos& out);
 static void cast_firebolt(Game& g,int dr,int dc){
     int fb_boost=g.inv.boost(SpellKind::Firebolt); int fb_cost=std::max(1,3 - fb_boost); if(g.player.mob.st.mp<fb_cost){ g.log.add("Not enough MP ("+std::to_string(fb_cost)+")."); return; } g.player.mob.st.mp-=fb_cost;
     int r=g.player.pos.r,c=g.player.pos.c;
     while(true){ r+=dr; c+=dc; if(!g.map.in(r,c) || opaque(g.map,r,c)) break;
         for(auto& e:g.ents) if(e.type==EntityType::Mob && e.mob.alive && e.pos.r==r && e.pos.c==c){
             int dmg=4+g.rng.i(0,3)+fb_boost;
- e.mob.st.hp-=dmg; e.mob.st.burning+=2; g.log.add("Firebolt hits "+e.mob.name+" for "+std::to_string(dmg)+"!");
- if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies.");
- grant_xp(g,e.mob.xp);
- g.kills[e.mob.name]++; level_up(g);
-} return; }
-    } g.log.add("The firebolt fizzles."); }
-static void cast_heal(Game& g){ if(g.player.mob.st.mp<4){ g.log.add("Not enough MP (4).");
- return; } g.player.mob.st.mp-=4; int before=g.player.mob.st.hp; g.player.mob.st.hp=std::min(g.player.mob.st.max_hp,g.player.mob.st.hp+6);
- g.log.add("You cast Heal ("+std::to_string(g.player.mob.st.hp-before)+" HP).");
- }
+            e.mob.st.hp-=dmg; e.mob.st.burning+=2; g.log.add("Firebolt hits "+e.mob.name+" for "+std::to_string(dmg)+"!");
+            if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies."); grant_xp(g,e.mob.xp); g.kills[e.mob.name]++; level_up(g); }
+            return;
+        }
+    }
+    g.log.add("The firebolt fizzles.");
+}
+static void cast_heal(Game& g){
+    int boost=g.inv.boost(SpellKind::Heal);
+    int cost=std::max(2,4-boost);
+    if(g.player.mob.st.mp<cost){ g.log.add("Not enough MP ("+std::to_string(cost)+")."); return; }
+    g.player.mob.st.mp-=cost; int before=g.player.mob.st.hp; int heal=6+boost;
+    g.player.mob.st.hp=std::min(g.player.mob.st.max_hp,g.player.mob.st.hp+heal);
+    g.log.add("You cast Heal ("+std::to_string(g.player.mob.st.hp-before)+" HP).");
+}
 static void cast_blink(Game& g){
-
     int b_boost=g.inv.boost(SpellKind::Blink); int b_cost=std::max(3,6 - b_boost);
     if(g.player.mob.st.mp<b_cost){ g.log.add("Not enough MP ("+std::to_string(b_cost)+")."); return; } 
     Pos tgt; if(!target_tile(g,20,tgt)){ g.log.add("Cancelled."); return; }
-    // must be visible and walkable
     if(!g.map.in(tgt.r,tgt.c) || !g.map.at(tgt.r,tgt.c).visible || !g.map.walkable(tgt.r,tgt.c)){ g.log.add("Cannot blink there."); return; }
-    g.player.mob.st.mp -= b_cost;
-    g.player.pos = tgt;
-    g.log.add("You blink.");
-
+    g.player.mob.st.mp -= b_cost; g.player.pos = tgt; g.log.add("You blink.");
 }
-
 static void cast_ice(Game& g,Pos target){
     int i_boost=g.inv.boost(SpellKind::IceShard); int i_cost=std::max(2,4 - i_boost); if(g.player.mob.st.mp<i_cost){ g.log.add("Not enough MP ("+std::to_string(i_cost)+")."); return; } g.player.mob.st.mp-=i_cost;
     if(!g.map.in(target.r,target.c) || !los_clear(g.map,g.player.pos,target)){ g.log.add("No line of sight."); return; }
     for(auto& e:g.ents) if(e.type==EntityType::Mob && e.mob.alive && e.pos==target){
-        int dmg=3+g.rng.i(0,2);
- e.mob.st.hp-=dmg; e.mob.st.snared+=2; g.log.add("Ice shard hits "+e.mob.name+" ("+std::to_string(dmg)+").");
- if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies.");
- grant_xp(g,e.mob.xp);
- g.kills[e.mob.name]++; level_up(g);
-} return; }
+        int dmg=3+g.rng.i(0,2)+i_boost/2;
+        e.mob.st.hp-=dmg; e.mob.st.snared+=2; g.log.add("Ice shard hits "+e.mob.name+" ("+std::to_string(dmg)+").");
+        if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" dies."); grant_xp(g,e.mob.xp); g.kills[e.mob.name]++; level_up(g); }
+        return;
+    }
     g.log.add("The shard shatters harmlessly.");
 }
-static void cast_shield(Game& g){ if(g.player.mob.st.mp<3){ g.log.add("Not enough MP (3).");
- return; } g.player.mob.st.mp-=3; g.player.mob.st.shield=5; g.log.add("A shimmering shield surrounds you (+2 DEF for 5 turns).");
- }
-
-// Targeting UI
+static void cast_shield(Game& g){
+    int boost=g.inv.boost(SpellKind::Shield);
+    int cost=std::max(1,3-boost);
+    if(g.player.mob.st.mp<cost){ g.log.add("Not enough MP ("+std::to_string(cost)+")."); return; }
+    g.player.mob.st.mp-=cost; g.player.mob.st.shield=5+boost; g.log.add("A shimmering shield surrounds you (+2 DEF for "+std::to_string(5+boost)+" turns).");
+}
+static void cast_fireball(Game& g, Pos target){
+    int boost = g.inv.boost(SpellKind::Fireball);
+    int cost = std::max(2, 6 - boost);
+    if(g.player.mob.st.mp < cost){ g.log.add("Not enough MP ("+std::to_string(cost)+")."); return; }
+    g.player.mob.st.mp -= cost;
+    if(!g.map.in(target.r,target.c) || !los_clear(g.map,g.player.pos,target)){ g.log.add("No line of sight."); return; }
+    int radius = 2 + (boost>=3?1:0);
+    auto inR = [&](int r,int c){ return std::abs(r-target.r)+std::abs(c-target.c) <= radius; };
+    if(inR(g.player.pos.r,g.player.pos.c)){ int dmg= g.rng.i(2,4) + boost; g.player.mob.st.hp -= dmg; g.player.mob.st.burning += 2; }
+    for(auto& e: g.ents){
+        if(e.type==EntityType::Mob && e.mob.alive && inR(e.pos.r,e.pos.c)){
+            int dmg= g.rng.i(4,7) + boost;
+            e.mob.st.hp -= dmg; e.mob.st.burning += 2;
+            if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" is incinerated."); grant_xp(g,e.mob.xp); g.kills[e.mob.name]++; }
+        }
+    }
+    for(int r=target.r-radius; r<=target.r+radius; ++r){
+        for(int c=target.c-radius; c<=target.c+radius; ++c){
+            if(!g.map.in(r,c)) continue;
+            if(inR(r,c) && g.map.walkable(r,c)){
+                g.firezones.push_back({r,c});
+                g.firettl.push_back(3 + boost);
+            }
+        }
+    }
+    g.log.add("You cast Fireball.");
+}
 static bool target_tile(Game& g,int range,Pos& out){
-
     Pos cur = g.player.pos;
     while(true){
         compute_fov(g.map,g.player.pos.r,g.player.pos.c,10);
         render(g);
-        // overlay cursor 'X' at screen coords if in view
         int sr = cur.r - g.cam_r;
         int sc = cur.c - g.cam_c;
         if(sr>=0 && sr<g.map.H && sc>=0 && sc<g.map.W){
@@ -1332,37 +1165,9 @@ static bool target_tile(Game& g,int range,Pos& out){
             cur = nxt;
         }
     }
+}
 
-}
-static void cast_fireball(Game& g, Pos target){
-    int boost = g.inv.boost(SpellKind::Fireball);
-    int cost = std::max(2, 6 - boost);
-    if(g.player.mob.st.mp < cost){ g.log.add("Not enough MP ("+std::to_string(cost)+")."); return; }
-    g.player.mob.st.mp -= cost;
-    if(!g.map.in(target.r,target.c) || !los_clear(g.map,g.player.pos,target)){ g.log.add("No line of sight."); return; }
-    int radius = 2 + (boost>=3?1:0);
-    auto inR = [&](int r,int c){ return std::abs(r-target.r)+std::abs(c-target.c) <= radius; };
-    if(inR(g.player.pos.r,g.player.pos.c)){ int dmg= g.rng.i(2,4) + boost; g.player.mob.st.hp -= dmg; g.player.mob.st.burning += 2; }
-    for(auto& e: g.ents){
-        if(e.type==EntityType::Mob && e.mob.alive && inR(e.pos.r,e.pos.c)){
-            int dmg= g.rng.i(4,7) + boost;
-            e.mob.st.hp -= dmg; e.mob.st.burning += 2;
-            if(e.mob.st.hp<=0){ e.mob.alive=false; g.log.add(e.mob.name+" is incinerated."); grant_xp(g,e.mob.xp); g.kills[e.mob.name]++; }
-        }
-    }
-    for(int r=target.r-radius; r<=target.r+radius; ++r){
-        for(int c=target.c-radius; c<=target.c+radius; ++c){
-            if(!g.map.in(r,c)) continue;
-            if(inR(r,c) && g.map.walkable(r,c)){
-                g.firezones.push_back({r,c});
-                g.firettl.push_back(3 + boost);
-            }
-        }
-    }
-    g.log.add("You cast Fireball.");
-}
 static void spell_menu(Game& g){
-
     while(true){
         io::move(0,0); io::clear();
         std::cout<<"Cast spell (MP "<<g.player.mob.st.mp<<"/"<<g.player.mob.st.max_mp<<")\n\n";
@@ -1373,7 +1178,7 @@ static void spell_menu(Game& g){
                 case SpellKind::Firebolt:{ int cost=std::max(1,3-boost); int dmg=4+boost; name="Firebolt ["+std::to_string(cost)+"MP] dmg~"+std::to_string(dmg)+" (dir)"; }break;
                 case SpellKind::Heal:{ int cost=std::max(2,4-boost); int hp=6+boost; name="Heal ["+std::to_string(cost)+"MP] heal "+std::to_string(hp); }break;
                 case SpellKind::Blink:{ int cost=std::max(3,6-boost); name="Blink ["+std::to_string(cost)+"MP] to visible"; }break;
-                case SpellKind::IceShard:{ int cost=std::max(2,4-boost); int dmg=3+boost; name="Ice Shard ["+std::to_string(cost)+"MP] dmg~"+std::to_string(dmg)+" + snare"; }break;
+                case SpellKind::IceShard:{ int cost=std::max(2,4-boost); int dmg=3+boost/2; name="Ice Shard ["+std::to_string(cost)+"MP] dmg~"+std::to_string(dmg)+" + snare"; }break;
                 case SpellKind::Shield:{ int cost=std::max(1,3-boost); int dur=5+boost; name="Shield ["+std::to_string(cost)+"MP] +DEF ("+std::to_string(dur)+"t)"; }break;
                 case SpellKind::Fireball:{ int cost=std::max(2,6-boost); int rad=2+(boost>=3?1:0); name="Fireball ["+std::to_string(cost)+"MP] AoE r="+std::to_string(rad)+" burn"; }break;
             }
@@ -1385,6 +1190,7 @@ static void spell_menu(Game& g){
         if(ch=='q') break;
         int idx=ch-'a';
         if(idx>=0 && idx<(int)g.inv.spells.size()){
+            extern void world_tick(Game&);
             auto s=g.inv.spells[idx];
             if(s==SpellKind::Firebolt){
                 std::cout<<"Direction (WASD/arrows) > "<<std::flush;
@@ -1409,14 +1215,9 @@ static void spell_menu(Game& g){
             }
         }
     }
-
 }
 
-
-
-
-
-
+// --- Trading ---
 static int price_of(const Item& it){
     switch(it.kind){
         case ItemKind::Dagger: return 8;
@@ -1453,15 +1254,26 @@ static void trade_modal(Game& g){
             std::cout<<"  "<<(char)('a'+i)<<") "<<it.name<<" - sell "<<price_of(it)<<"g\n";
         }
         if(g.inv.items.empty()) std::cout<<"  (nothing to sell)\n";
-        std::cout<<"(letter) sell, (q)uit\n> "<<std::flush;
+        std::cout<<"\nBuy: (k) key 5g, (h) heal 6g, (p) mapping 10g, (f) Fireball 25g\n";
+        std::cout<<"(letter) sell, (b)uy item, (q)uit\n> "<<std::flush;
         int ch = io::getch_blocking();
         if(ch=='q') break;
+        if(ch=='b'){
+            std::cout<<"Buy what? k/h/p/f > "<<std::flush;
+            int x=io::getch_blocking();
+            auto buy=[&](Item it,int cost){
+                if(g.gold<cost){ g.log.add("Not enough gold."); return; }
+                g.gold-=cost; if(it.kind==ItemKind::Key){ g.inv.keys++; g.log.add("Bought a key."); } else { g.inv.items.push_back(it); g.log.add("Bought: "+it.name); }
+            };
+            if(x=='k'||x=='K'){ Item it; it.kind=ItemKind::Key; it.name="small key"; it.glyph=';'; it.power=1; buy(it,5); }
+            else if(x=='h'||x=='H'){ Item it; it.kind=ItemKind::PotionHeal; it.name="potion of healing"; it.glyph='!'; it.power= g.rng.i(4,9); buy(it,6); }
+            else if(x=='p'||x=='P'){ Item it; it.kind=ItemKind::ScrollMapping; it.name="scroll of mapping"; it.glyph='?'; buy(it,10); }
+            else if(x=='f'||x=='F'){ Item it; it.kind=ItemKind::SpellbookFireball; it.name="spellbook: Fireball"; it.glyph='?'; buy(it,25); }
+            continue;
+        }
         int idx = ch - 'a';
         if(idx>=0 && idx<(int)g.inv.items.size()){
-            // cannot sell equipped weapon/armor
-            if(idx==g.inv.weapon_idx || idx==g.inv.armor_idx){
-                g.log.add("Unequip first."); continue;
-            }
+            if(idx==g.inv.weapon_idx || idx==g.inv.armor_idx){ g.log.add("Unequip first."); continue; }
             int gold = price_of(g.inv.items[idx]);
             g.gold += gold;
             g.log.add("Sold for "+std::to_string(gold)+"g.");
@@ -1472,8 +1284,7 @@ static void trade_modal(Game& g){
     }
 }
 
-static void world_tick(Game& g){
-    // burning zones
+void world_tick(Game& g){
     for(size_t i=0;i<g.firezones.size();){
         Pos z=g.firezones[i];
         if(g.player.pos==z){ g.player.mob.st.burning += 1; }
@@ -1482,22 +1293,13 @@ static void world_tick(Game& g){
         if(g.firettl[i]<=0){ g.firezones.erase(g.firezones.begin()+i); g.firettl.erase(g.firettl.begin()+i); }
         else ++i;
     }
-    // bombs: tick fuse and explode when zero (3x3 square => Chebyshev radius 1)
     for(size_t i=0;i<g.ents.size();){
         auto& e = g.ents[i];
         if(e.type==EntityType::BombPlaced){
             e.fuse--;
             if(e.fuse<=0){
                 int r0=e.pos.r, c0=e.pos.c;
-                for(int dr=-1; dr<=1; ++dr){
-                    for(int dc=-1; dc<=1; ++dc){
-                        int rr=r0+dr, cc=c0+dc;
-                        if(g.map.in(rr,cc)){
-                            explode_at(g, rr, cc, 0); // use radius 0 cell-by-cell to reuse explosion effect
-                        }
-                    }
-                }
-                // remove bomb entity
+                for(int dr=-1; dr<=1; ++dr) for(int dc=-1; dc<=1; ++dc){ int rr=r0+dr, cc=c0+dc; if(g.map.in(rr,cc)) explode_at(g, rr, cc, 0); }
                 g.ents.erase(g.ents.begin()+i);
                 continue;
             }
@@ -1505,6 +1307,7 @@ static void world_tick(Game& g){
         ++i;
     }
 }
+
 int main(){
     io::enableVT();
 #ifndef _WIN32
@@ -1531,9 +1334,7 @@ int main(){
             case CmdType::Options: options_modal(g); break;
             case CmdType::Trade: trade_modal(g); break;
             case CmdType::CamPan: g.cam_follow=false; g.cam_r += cmd.dr; g.cam_c += cmd.dc; if(g.cam_r<0) g.cam_r=0; if(g.cam_c<0) g.cam_c=0; break;
-            case CmdType::Descend: { auto t=g.map.at(g.player.pos.r,g.player.pos.c).t; if(t==Tile::StairsDown || t==Tile::Teleporter) next_level(g);
- else g.log.add("No exit here.");
- } break;
+            case CmdType::Descend: { auto t=g.map.at(g.player.pos.r,g.player.pos.c).t; if(t==Tile::StairsDown || t==Tile::Teleporter) next_level(g); else g.log.add("No exit here."); } break;
             case CmdType::Help: show_help(); break;
             case CmdType::SaveQuit: save_game(g); g.running=false; break;
             case CmdType::NewGame: new_game(g); break;
